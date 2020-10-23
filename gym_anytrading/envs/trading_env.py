@@ -2,108 +2,152 @@ import gym
 from gym import spaces
 from gym.utils import seeding
 import numpy as np
-from enum import Enum
 import matplotlib.pyplot as plt
 
 
-class Actions(Enum):
-    Sell = 0
-    Buy = 1
-
-
-class Positions(Enum):
-    Short = 0
-    Long = 1
-
-    def opposite(self):
-        return Positions.Short if self == Positions.Long else Positions.Long
-
-
 class TradingEnv(gym.Env):
-
+    """Base stock trading environment for OpenAI gym"""
     metadata = {'render.modes': ['human']}
 
-    def __init__(self, df, window_size):
-        assert df.ndim == 2
+    def __init__(self, action_space, observation_space, start_t, end_t):
+        super(TradingEnv, self).__init__()
 
         self.seed()
-        self.df = df
-        self.window_size = window_size
-        self.prices, self.signal_features = self._process_data()
-        self.shape = (window_size, self.signal_features.shape[1])
 
-        # spaces
-        self.action_space = spaces.Discrete(len(Actions))
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=self.shape, dtype=np.float32)
+        # openAi gym env params
+        self.action_space = action_space
+        self.observation_space = observation_space
 
-        # episode
-        self._start_tick = self.window_size
-        self._end_tick = len(self.prices) - 1
-        self._done = None
-        self._current_tick = None
-        self._last_trade_tick = None
-        self._position = None
-        self._position_history = None
-        self._total_reward = None
-        self._total_profit = None
-        self._first_rendering = None
-        self.history = None
+        # historic data
+        self.history = {}
+        self._action_value_history = start_t * [None]
 
+        # agent's performance market metrics
+        self._total_return = 0.
+        self._total_reward = 0.
+
+        # simulation params
+        self._start_t = start_t
+        self._end_t = end_t
+
+        # additional env params
+        self.max_episode_steps = self._end_t - (self._start_t - 1)
 
     def seed(self, seed=None):
         self.np_random, seed = seeding.np_random(seed)
         return [seed]
 
-
-    def reset(self):
-        self._done = False
-        self._current_tick = self._start_tick
-        self._last_trade_tick = self._current_tick - 1
-        self._position = Positions.Short
-        self._position_history = (self.window_size * [None]) + [self._position]
-        self._total_reward = 0.
-        self._total_profit = 1.  # unit
-        self._first_rendering = True
-        self.history = {}
-        return self._get_observation()
-
-
     def step(self, action):
-        self._done = False
-        self._current_tick += 1
+        err_msg = "%r (%s) invalid".format(action, type(action))
+        assert self.action_space.contains(action), err_msg
 
-        if self._current_tick == self._end_tick:
-            self._done = True
+        last_step = True if self._current_t == self._end_t else False
 
-        step_reward = self._calculate_reward(action)
-        self._total_reward += step_reward
+        self._action_value = self._get_action_value(action, last_step)
 
-        self._update_profit(action)
+        step_reward, step_return = self._calculate_reward()
 
-        trade = False
-        if ((action == Actions.Buy.value and self._position == Positions.Short) or
-            (action == Actions.Sell.value and self._position == Positions.Long)):
-            trade = True
-
-        if trade:
-            self._position = self._position.opposite()
-            self._last_trade_tick = self._current_tick
-
-        self._position_history.append(self._position)
         observation = self._get_observation()
+
+        self._last_trade_tick = self._current_t
+
+        self._action_value_history.append(self._action_value)
+
         info = dict(
-            total_reward = self._total_reward,
-            total_profit = self._total_profit,
-            position = self._position.value
+            date=self._get_current_date(),
+            total_return=self._total_return,
+            total_reward=self._total_reward,
+            action_value=self._action_value,
         )
+
         self._update_history(info)
 
-        return observation, step_reward, self._done, info
+        if last_step:
+            self._episode_over = True
+        else:
+            self._episode_over = False
+            self._current_t += 1
 
+        return observation, step_reward, self._episode_over, info
+
+    def reset(self):
+        self._episode_over = False
+        self._current_t = self._start_t
+        self._last_trade_tick = self._current_t - 1
+        self._action_value = None
+        self._total_return = 0.
+        self._total_reward = 0.
+        self._action_value_history = self._start_t * [None]
+        self._reward_history = self._start_t * [None]
+        self._return_history = self._start_t * [None]
+        self._first_rendering = True
+
+        self.history = {}
+
+        return self._get_observation()
+
+    # This render was not designed to run step by step, it should run only at the end of episode
+    def render(self, mode='human'):
+        self._plot_history()
+
+    def close(self):
+        return
+
+    def _process_data(self):
+        raise NotImplementedError
+
+    def _calculate_reward(self):
+        return NotImplementedError
 
     def _get_observation(self):
-        return self.signal_features[(self._current_tick-self.window_size):self._current_tick]
+        return NotImplementedError
 
+    def _get_action_value(self, action, last_step):
+        return NotImplementedError
+
+    def _plot_history(self):
+        window_ticks = np.arange(len(self._return_history))
+
+        fig, ax1 = plt.subplots()
+
+        ax1.plot(self._prices)
+
+        ax2 = ax1.twinx()
+
+        short_ticks = []
+        long_ticks = []
+        neg_rewards = []
+        pos_rewards = []
+        neutral_ticks = []
+        for i, tick in enumerate(window_ticks):
+            # actions history plotting
+            if self._action_value_history[i]:
+                if self._action_value_history[i] < 0:
+                    short_ticks.append(tick)
+                elif self._action_value_history[i] > 0:
+                    long_ticks.append(tick)
+                else:
+                    neutral_ticks.append(tick)
+
+            # reward history plotting
+            if self._return_history[i]:
+                if self._return_history[i] < 0:
+                    neg_rewards.append(tick)
+                elif self._return_history[i] >= 0:
+                    pos_rewards.append(tick)
+
+        ax1.plot(short_ticks, self._prices[short_ticks], 'bv')
+        ax1.plot(long_ticks, self._prices[long_ticks], 'b^')
+        ax1.plot(neutral_ticks, self._prices[neutral_ticks], 'b_')
+
+        reward_array = np.asarray(self._return_history)
+
+        ax2.bar(neg_rewards, reward_array[neg_rewards], color='r')
+        ax2.bar(pos_rewards, reward_array[pos_rewards], color='g')
+
+        fig.suptitle(
+            "Total Profit: %.6f" % self._total_reward
+        )
 
     def _update_history(self, info):
         if not self.history:
@@ -112,79 +156,9 @@ class TradingEnv(gym.Env):
         for key, value in info.items():
             self.history[key].append(value)
 
+    def _convert_action(self, action):
+        return NotImplementedError
 
-    def render(self, mode='human'):
-
-        def _plot_position(position, tick):
-            color = None
-            if position == Positions.Short:
-                color = 'red'
-            elif position == Positions.Long:
-                color = 'green'
-            if color:
-                plt.scatter(tick, self.prices[tick], color=color)
-
-        if self._first_rendering:
-            self._first_rendering = False
-            plt.cla()
-            plt.plot(self.prices)
-            start_position = self._position_history[self._start_tick]
-            _plot_position(start_position, self._start_tick)
-
-        _plot_position(self._position, self._current_tick)
-
-        plt.suptitle(
-            "Total Reward: %.6f" % self._total_reward + ' ~ ' +
-            "Total Profit: %.6f" % self._total_profit
-        )
-
-        plt.pause(0.01)
-
-
-    def render_all(self, mode='human'):
-        window_ticks = np.arange(len(self._position_history))
-        plt.plot(self.prices)
-
-        short_ticks = []
-        long_ticks = []
-        for i, tick in enumerate(window_ticks):
-            if self._position_history[i] == Positions.Short:
-                short_ticks.append(tick)
-            elif self._position_history[i] == Positions.Long:
-                long_ticks.append(tick)
-
-        plt.plot(short_ticks, self.prices[short_ticks], 'ro')
-        plt.plot(long_ticks, self.prices[long_ticks], 'go')
-
-        plt.suptitle(
-            "Total Reward: %.6f" % self._total_reward + ' ~ ' +
-            "Total Profit: %.6f" % self._total_profit
-        )
-        
-        
-    def close(self):
-        plt.close()
-
-
-    def save_rendering(self, filepath):
-        plt.savefig(filepath)
-
-
-    def pause_rendering(self):
-        plt.show()
-
-
-    def _process_data(self):
+    def _get_current_date(self):
         raise NotImplementedError
 
-
-    def _calculate_reward(self, action):
-        raise NotImplementedError
-
-
-    def _update_profit(self, action):
-        raise NotImplementedError
-
-
-    def max_possible_profit(self):  # trade fees are ignored
-        raise NotImplementedError
